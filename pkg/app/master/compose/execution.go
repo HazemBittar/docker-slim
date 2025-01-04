@@ -6,15 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/docker-slim/docker-slim/pkg/app"
-	"github.com/docker-slim/docker-slim/pkg/docker/dockerutil"
+	"github.com/slimtoolkit/slim/pkg/app"
+	"github.com/slimtoolkit/slim/pkg/docker/dockerutil"
 
 	"github.com/compose-spec/compose-go/loader"
 	"github.com/compose-spec/compose-go/types"
@@ -23,6 +22,17 @@ import (
 )
 
 var ErrNoServiceImage = errors.New("no service image")
+
+type ServiceError struct {
+	Service string
+	Op      string
+	Info    string
+}
+
+func (e *ServiceError) Error() string {
+	return fmt.Sprintf("compose.ServiceError: service=%s op=%s info='%s'",
+		e.Service, e.Op, e.Info)
+}
 
 type ovars = app.OutVars
 
@@ -54,7 +64,7 @@ const (
 	XEInterrupt                  = "xe.interrupt"
 )
 
-type ExecutionEvenInfo struct {
+type ExecutionEventInfo struct {
 	Event ExecutionEvent
 	Data  map[string]string
 }
@@ -73,26 +83,28 @@ const (
 )
 
 type ExecutionOptions struct {
+	SvcStartWait int
 }
 
 type Execution struct {
 	*ConfigInfo
-	State           ExecutionState
-	Selectors       *ServiceSelectors
-	BuildImages     bool
-	PullImages      bool
-	OwnAllResources bool
-	AllServiceNames map[string]struct{}
-	AllServices     map[string]*ServiceInfo
-	AllNetworks     map[string]*NetworkInfo
-	PendingServices map[string]struct{}
-	RunningServices map[string]*RunningService
-	ActiveVolumes   map[string]*ActiveVolume
-	ActiveNetworks  map[string]*ActiveNetwork
-	StopTimeout     uint
+	State             ExecutionState
+	Selectors         *ServiceSelectors
+	BuildImages       bool
+	PullImages        bool
+	OwnAllResources   bool
+	AllServiceNames   map[string]struct{}
+	AllServices       map[string]*ServiceInfo
+	AllNetworks       map[string]*NetworkInfo
+	PendingServices   map[string]struct{}
+	RunningServices   map[string]*RunningService
+	ActiveVolumes     map[string]*ActiveVolume
+	ActiveNetworks    map[string]*ActiveNetwork
+	StopTimeout       uint
+	ContainerProbeSvc string
 
 	options    *ExecutionOptions
-	eventCh    chan *ExecutionEvenInfo
+	eventCh    chan *ExecutionEventInfo
 	printState bool
 	xc         *app.ExecutionContext
 	logger     *log.Entry
@@ -155,8 +167,9 @@ type RunningService struct {
 }
 
 type ActiveVolume struct {
-	Name string
-	ID   string
+	ShortName string
+	FullName  string
+	ID        string
 }
 
 type ActiveNetwork struct {
@@ -201,7 +214,7 @@ func NewConfigInfo(
 			cv.BaseComposeDir = workingDir
 		}
 
-		b, err := ioutil.ReadFile(fullComposeFilePath)
+		b, err := os.ReadFile(fullComposeFilePath)
 		if err != nil {
 			return nil, err
 		}
@@ -278,12 +291,13 @@ func NewExecution(
 	workingDir string,
 	envVars []string,
 	environmentNoHost bool,
+	containerProbeComposeSvc string,
 	buildImages bool,
 	pullImages bool,
 	pullExcludes []string,
 	ownAllResources bool,
 	options *ExecutionOptions,
-	eventCh chan *ExecutionEvenInfo,
+	eventCh chan *ExecutionEventInfo,
 	printState bool) (*Execution, error) {
 	if logger != nil {
 		logger = logger.WithFields(log.Fields{"com": "compose.execution"})
@@ -303,26 +317,27 @@ func NewExecution(
 
 	//not supporting compose profiles for now
 	exe := &Execution{
-		ConfigInfo:      configInfo,
-		State:           XSNone,
-		Selectors:       selectors,
-		OwnAllResources: ownAllResources,
-		BuildImages:     buildImages,
-		PullImages:      pullImages,
-		AllServiceNames: map[string]struct{}{},
-		AllServices:     map[string]*ServiceInfo{},
-		AllNetworks:     map[string]*NetworkInfo{},
-		PendingServices: map[string]struct{}{},
-		RunningServices: map[string]*RunningService{},
-		ActiveVolumes:   map[string]*ActiveVolume{},
-		ActiveNetworks:  map[string]*ActiveNetwork{},
-		StopTimeout:     defaultStopTimeout,
-		apiClient:       apiClient,
-		options:         options,
-		eventCh:         eventCh,
-		printState:      printState,
-		xc:              xc,
-		logger:          logger,
+		ConfigInfo:        configInfo,
+		State:             XSNone,
+		Selectors:         selectors,
+		OwnAllResources:   ownAllResources,
+		BuildImages:       buildImages,
+		PullImages:        pullImages,
+		AllServiceNames:   map[string]struct{}{},
+		AllServices:       map[string]*ServiceInfo{},
+		AllNetworks:       map[string]*NetworkInfo{},
+		PendingServices:   map[string]struct{}{},
+		RunningServices:   map[string]*RunningService{},
+		ActiveVolumes:     map[string]*ActiveVolume{},
+		ActiveNetworks:    map[string]*ActiveNetwork{},
+		ContainerProbeSvc: containerProbeComposeSvc,
+		StopTimeout:       defaultStopTimeout,
+		apiClient:         apiClient,
+		options:           options,
+		eventCh:           eventCh,
+		printState:        printState,
+		xc:                xc,
+		logger:            logger,
 	}
 
 	exe.initVersion()
@@ -475,6 +490,11 @@ func (ref *Execution) initServices() error {
 		}
 	}
 
+	if ref.ContainerProbeSvc != "" {
+		ref.AllServices[ref.ContainerProbeSvc].Selected = true
+		ref.Selectors.Includes[ref.ContainerProbeSvc] = struct{}{}
+	}
+
 	ref.logger.Debug("Execution.initServices: checking ref.AllServices[x].Selected")
 	for shortName, svc := range ref.AllServices {
 		ref.logger.Debugf("sname=%s/%s name=%s SELECTED?=%v\n",
@@ -566,7 +586,8 @@ func (ref *Execution) PrepareServices() error {
 			ref.logger.Debugf("Execution.Prepare: service=%s", svcName)
 			if err := ref.PrepareService(ctx, svcName); err != nil {
 				ref.logger.Debugf("Execution.Prepare: PrepareService(%s) error - %v", svcName, err)
-				errCh <- fmt.Errorf("error preparing service - %s (%s)", svcName, err.Error())
+				//errCh <- fmt.Errorf("error preparing service - %s (%s)", svcName, err.Error())
+				errCh <- &ServiceError{Service: svcName, Op: "Execution.PrepareService", Info: err.Error()}
 				ref.logger.Debugf("Execution.Prepare: PrepareService(%s) - CANCEL ALL PREPARE SVC", svcName)
 				cancel()
 			}
@@ -635,9 +656,11 @@ func (ref *Execution) PrepareService(ctx context.Context, name string) error {
 			}
 
 			if !found {
+				ref.logger.Debugf("Execution.PrepareService(%s): image=%s - no image and image pull did not pull image", name, service.Image)
 				return ErrNoServiceImage
 			}
 		} else {
+			ref.logger.Debugf("Execution.PrepareService(%s): image=%s - no image and image pull is not enabled", name, service.Image)
 			return ErrNoServiceImage
 		}
 	}
@@ -672,6 +695,12 @@ func (ref *Execution) StartServices() error {
 			}
 
 			ref.logger.Debugf("Execution.StartServices: starting service=%s (image=%s)", service.Name, fullSvcInfo.Config.Image)
+
+			if ref.options.SvcStartWait > 0 {
+				ref.logger.Debugf("Execution.StartServices: waiting %v seconds before starting service=%s (image=%s)", ref.options.SvcStartWait, service.Name, fullSvcInfo.Config.Image)
+				time.Sleep(time.Duration(ref.options.SvcStartWait) * time.Second)
+			}
+
 			err := ref.StartService(service.Name)
 			if err != nil {
 				ref.logger.Debugf("Execution.StartServices: ref.StartService() error = %v", err)
@@ -767,7 +796,7 @@ func (ref *Execution) StopServices() error {
 
 	for key := range ref.RunningServices {
 		err := ref.StopService(key)
-		if err != nil {
+		if err != nil && key != ref.ContainerProbeSvc {
 			return err
 		}
 	}
@@ -779,7 +808,7 @@ func (ref *Execution) CleanupServices() error {
 
 	for key := range ref.RunningServices {
 		err := ref.CleanupService(key)
-		if err != nil {
+		if err != nil && key != ref.ContainerProbeSvc {
 			return err
 		}
 	}
@@ -787,7 +816,7 @@ func (ref *Execution) CleanupServices() error {
 }
 
 func (ref *Execution) StopService(key string) error {
-	ref.logger.Debug("Execution.StopService(%s)\n", key)
+	ref.logger.Debugf("Execution.StopService(%s)\n", key)
 	service, running := ref.RunningServices[key]
 	if !running {
 		ref.logger.Debugf("Execution.StopService(%s) - no running service", key)
@@ -843,7 +872,8 @@ const (
 	rtLabelApp        = "ds.runtime.container.type"
 	rtLabelProject    = "ds.engine.compose.project"
 	rtLabelService    = "ds.engine.compose.service"
-	rtLabelVolume     = "ds.engine.compose.volume"
+	rtLabelVolumeName = "ds.engine.compose.volume.name"
+	rtLabelVolumeKey  = "ds.engine.compose.volume.key"
 	rtLabelNetwork    = "ds.engine.compose.network"
 )
 
@@ -868,6 +898,8 @@ func MountsFromVolumeConfigs(
 	activeVolumes map[string]*ActiveVolume) ([]dockerapi.HostMount, error) {
 	mounts := []dockerapi.HostMount{}
 	for _, c := range configs {
+		log.Debugf("compose.MountsFromVolumeConfigs(): volumeConfig=%#v", c)
+
 		mount := dockerapi.HostMount{
 			Type:     c.Type,
 			Target:   c.Target,
@@ -889,8 +921,12 @@ func MountsFromVolumeConfigs(
 					}
 				}
 
+				log.Debugf("compose.MountsFromVolumeConfigs(): no active volume (orig.source='%s' source='%s' activeVolumes=%#v)",
+					c.Source, source, activeVolumes)
+
 				mount.Type = types.VolumeTypeBind
 			} else {
+				log.Debugf("compose.MountsFromVolumeConfigs(): activeVolume='%s'", source)
 				mount.Type = types.VolumeTypeVolume
 			}
 
@@ -942,9 +978,9 @@ func EnvVarsFromService(varMap types.MappingWithEquals, varFiles types.StringLis
 	}
 
 	for _, file := range varFiles {
-		data, err := ioutil.ReadFile(file)
+		data, err := os.ReadFile(file)
 		if err != nil {
-			fmt.Printf("EnvVarsFromService: error reading '%s' - %v\n", err)
+			log.Debugf("compose.EnvVarsFromService: error reading '%s' - %v", file, err)
 			continue
 		}
 
@@ -981,7 +1017,7 @@ func HasImage(dclient *dockerapi.Client, imageRef string) (bool, error) {
 		return false, err
 	}
 
-	log.Debugf("HasImage(%s): image identity - %#v", imageRef, info)
+	log.Debugf("compose.HasImage(%s): image identity - %#v", imageRef, info)
 
 	var repo string
 	var tag string
@@ -1002,12 +1038,12 @@ func HasImage(dclient *dockerapi.Client, imageRef string) (bool, error) {
 
 	for _, t := range info.ShortTags {
 		if t == tag {
-			log.Debugf("HasImage(%s): FOUND IT - %s (%s)", imageRef, t, repo)
+			log.Debugf("compose.HasImage(%s): FOUND IT - %s (%s)", imageRef, t, repo)
 			return true, nil
 		}
 	}
 
-	log.Debugf("HasImage(%s): NOT FOUND IT", imageRef)
+	log.Debugf("compose.HasImage(%s): NOT FOUND IT", imageRef)
 	return false, nil
 }
 
@@ -1093,7 +1129,7 @@ func pullImage(ctx context.Context, apiClient *dockerapi.Client, imageRef string
 	return nil
 }
 
-//TODO: move builder into pkg
+// TODO: move builder into pkg
 func buildImage(ctx context.Context, apiClient *dockerapi.Client, basePath, imageName string, config *types.BuildConfig) error {
 	log.Debugf("buildImage(%s,%s)", basePath, imageName)
 
@@ -1495,24 +1531,28 @@ func portBindingsFromServicePortConfigs(configs []types.ServicePortConfig) map[d
 	return result
 }
 
-func createVolume(apiClient *dockerapi.Client, projectName, name string, config types.VolumeConfig) (string, error) {
-	id := fmt.Sprintf("%s_%s", projectName, name)
-	labels := map[string]string{
-		rtLabelApp:     rtLabelAppVersion,
-		rtLabelProject: projectName,
-		rtLabelVolume:  name,
+func createVolume(apiClient *dockerapi.Client, projectName, volKey, volFullName string, config types.VolumeConfig) (string, error) {
+	labels := config.Labels
+	if labels == nil {
+		labels = map[string]string{}
 	}
 
+	labels[rtLabelApp] = rtLabelAppVersion
+	labels[rtLabelProject] = projectName
+	labels[rtLabelVolumeName] = volFullName
+	labels[rtLabelVolumeKey] = volKey
+
 	volumeOptions := dockerapi.CreateVolumeOptions{
-		Name:       id,
+		Name:       volFullName, //already includes the project prefix
 		Driver:     config.Driver,
 		DriverOpts: config.DriverOpts,
 		Labels:     labels,
 	}
 
+	log.Debugf("createVolume(%s, %s, %s) volumeOptions=%#v", projectName, volKey, volFullName, volumeOptions)
 	volumeInfo, err := apiClient.CreateVolume(volumeOptions)
 	if err != nil {
-		log.Debugf("dclient.CreateVolume() error = %v", err)
+		log.Debugf("apiClient.CreateVolume() error = %v", err)
 		return "", err
 	}
 
@@ -1523,20 +1563,22 @@ func (ref *Execution) CreateVolumes() error {
 	projectName := strings.Trim(ref.Project.Name, "-_")
 
 	for key, volume := range ref.Project.Volumes {
-		ref.logger.Debugf("CreateVolumes: key=%s name=%s", key, volume.Name)
-		name := key
+		name := fmt.Sprintf("%s_%s", projectName, key)
+		ref.logger.Debugf("CreateVolumes: key=%s gen.Name=%s volume.Name=%s", key, name, volume.Name)
+
 		if volume.Name != "" {
 			name = volume.Name
 		}
 
-		id, err := createVolume(ref.apiClient, projectName, name, volume)
+		id, err := createVolume(ref.apiClient, projectName, key, name, volume)
 		if err != nil {
 			return err
 		}
 
-		ref.ActiveVolumes[name] = &ActiveVolume{
-			Name: name,
-			ID:   id,
+		ref.ActiveVolumes[key] = &ActiveVolume{
+			ShortName: key,
+			FullName:  name,
+			ID:        id,
 		}
 	}
 
@@ -1548,7 +1590,7 @@ func (ref *Execution) DeleteVolumes() error {
 		ref.logger.Debugf("DeleteVolumes: key/name=%s ID=%s", key, volume.ID)
 
 		err := deleteVolume(ref.apiClient, volume.ID)
-		if err != nil {
+		if err != nil && key != ref.ContainerProbeSvc {
 			return err
 		}
 
@@ -1702,7 +1744,7 @@ func (ref *Execution) DeleteNetworks() error {
 		}
 
 		err := deleteNetwork(ref.apiClient, network.ID)
-		if err != nil {
+		if err != nil && key != ref.ContainerProbeSvc {
 			return err
 		}
 

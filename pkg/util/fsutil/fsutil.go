@@ -2,9 +2,10 @@ package fsutil
 
 import (
 	"archive/tar"
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"golang.org/x/sys/unix"
 	"io"
 	"os"
 	"path/filepath"
@@ -12,8 +13,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/docker-slim/docker-slim/pkg/pdiscover"
-	"github.com/docker-slim/docker-slim/pkg/util/errutil"
+	"golang.org/x/sys/unix"
+
+	"github.com/slimtoolkit/slim/pkg/pdiscover"
+	"github.com/slimtoolkit/slim/pkg/util/errutil"
 
 	"github.com/bmatcuk/doublestar"
 	log "github.com/sirupsen/logrus"
@@ -45,6 +48,7 @@ const (
 
 // Directory and file related errors
 var (
+	ErrNoFileData                = errors.New("no file data")
 	ErrNoSrcDir                  = errors.New("no source directory path")
 	ErrNoDstDir                  = errors.New("no destination directory path")
 	ErrSameDir                   = errors.New("source and destination directories are the same")
@@ -129,7 +133,7 @@ func FileModeIsSetuid(mode os.FileMode) bool {
 }
 
 const (
-	rootStateKey           = ".docker-slim-state"
+	rootStateKey           = ".slim-state"
 	releasesStateKey       = "releases"
 	imageStateBaseKey      = "images"
 	imageStateArtifactsKey = "artifacts"
@@ -148,8 +152,8 @@ var badInstallPaths = [...]string{
 
 const (
 	tmpPath        = "/tmp"
-	stateTmpPath   = "/tmp/docker-slim-state"
-	sensorFileName = "docker-slim-sensor"
+	stateTmpPath   = "/tmp/slim-state"
+	sensorFileName = "slim-sensor"
 )
 
 // AccessInfo provides the file object access properties
@@ -249,6 +253,51 @@ func IsSymlink(target string) bool {
 	}
 
 	return (info.Mode() & os.ModeSymlink) == os.ModeSymlink
+}
+
+// IsTarFile returns true if the target file system object is a tar archive
+func IsTarFile(target string) bool {
+	tf, err := os.Open(target)
+	if err != nil {
+		log.Debugf("fsutil.IsTarFile(%s): error - %v", target, err)
+		return false
+	}
+
+	defer tf.Close()
+	tr := tar.NewReader(tf)
+	_, err = tr.Next()
+	if err != nil {
+		log.Debugf("fsutil.IsTarFile(%s): error - %v", target, err)
+		return false
+	}
+
+	return true
+}
+
+func HasReadAccess(dst string) (bool, error) {
+	err := unix.Access(dst, unix.R_OK)
+	if err == nil {
+		return true, nil
+	}
+
+	if err == unix.EACCES {
+		return false, nil
+	}
+
+	return false, err
+}
+
+func HasWriteAccess(dst string) (bool, error) {
+	err := unix.Access(dst, unix.W_OK)
+	if err == nil {
+		return true, nil
+	}
+
+	if err == unix.EACCES {
+		return false, nil
+	}
+
+	return false, err
 }
 
 // SetAccess updates the access permissions on the destination
@@ -361,7 +410,7 @@ func CopySymlinkFile(clone bool, src, dst string, makeDir bool) error {
 				}
 
 				if err := os.Lchown(dst, int(ssi.Uid), int(ssi.Gid)); err != nil {
-					log.Warnln("CopySymlinkFile(%v,%v)- unable to change owner", src, dst)
+					log.Warnf("CopySymlinkFile(%v,%v)- unable to change owner", src, dst)
 				}
 			}
 		} else {
@@ -432,11 +481,20 @@ func cloneDirPath(src, dst string) {
 	}
 
 	for _, dir := range dirs {
-		//fmt.Printf("cloning dir path = %#v\n", dir)
-		err = os.Mkdir(dir.dst, 0777)
-		if err != nil && !os.IsExist(err) {
-			errutil.FailOn(err)
+		if Exists(dir.dst) {
+			log.Debugf("cloneDirPath() - dst dir exists - %v", dir.dst)
+			continue
 		}
+
+		//using os.MkdirAll instead of os.Mkdir to make sure we don't miss any intermediate directories
+		//need to research when we might miss intermediate directories
+		err = os.MkdirAll(dir.dst, 0777)
+		if err != nil {
+			log.Errorf("cloneDirPath() - os.MkdirAll(%v) error - %v", dir.dst, err)
+		}
+		//if err != nil && !os.IsExist(err) {
+		//	errutil.FailOn(err)
+		//}
 
 		if err == nil {
 			if err := os.Chmod(dir.dst, dir.perms); err != nil {
@@ -449,7 +507,7 @@ func cloneDirPath(src, dst string) {
 				}
 
 				if err := os.Chown(dir.dst, int(dir.sys.Uid), int(dir.sys.Gid)); err != nil {
-					log.Warnln("cloneDirPath()- unable to change owner (%v) - %v", dir.dst, err)
+					log.Warnf("cloneDirPath()- unable to change owner (%v) - %v", dir.dst, err)
 				}
 			}
 		}
@@ -534,7 +592,7 @@ func CopyRegularFile(clone bool, src, dst string, makeDir bool) error {
 
 	//Need to close dst file before chmod works the right way
 	if err := d.Close(); err != nil {
-		log.Debugf("CopyRegularFile(%v,%v,%v) - d.Close error - %v", src, dst, err)
+		log.Debugf("CopyRegularFile() - d.Close error - %v", err)
 		return err
 	}
 
@@ -552,7 +610,7 @@ func CopyRegularFile(clone bool, src, dst string, makeDir bool) error {
 				}
 
 				if err := os.Chown(dst, int(ssi.Uid), int(ssi.Gid)); err != nil {
-					log.Warnln("CopyRegularFile(%v,%v)- unable to change owner", src, dst)
+					log.Warnf("CopyRegularFile(%v,%v)- unable to change owner", src, dst)
 				}
 			}
 		} else {
@@ -572,6 +630,178 @@ func CopyRegularFile(clone bool, src, dst string, makeDir bool) error {
 			}
 		} else {
 			log.Warnf("CopyRegularFile(%v,%v)- unable to get Stat_t", src, dst)
+		}
+	}
+
+	return nil
+}
+
+// CopyAndObfuscateFile copies a regular file and performs basic file reference obfuscation
+func CopyAndObfuscateFile(
+	clone bool,
+	src string,
+	dst string,
+	makeDir bool) error {
+	log.Debugf("CopyAndObfuscateFile(%v,%v,%v,%v)", clone, src, dst, makeDir)
+
+	//need to preserve the extension because some of the app stacks
+	//depend on it for its compile/run time behavior
+	base := filepath.Base(dst)
+	ext := filepath.Ext(base)
+	base = strings.ReplaceAll(base, ".", "..")
+	base = fmt.Sprintf(".d.%s", base)
+	if ext != "" {
+		base = fmt.Sprintf("%s%s", base, ext)
+	}
+
+	dirPart := filepath.Dir(dst)
+	dstData := filepath.Join(dirPart, base)
+	err := CopyRegularFile(clone, src, dstData, makeDir)
+	if err != nil {
+		return err
+	}
+
+	err = os.Symlink(base, dst)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// AppendToFile appends the provided data to the target file
+func AppendToFile(target string, data []byte, preserveTimes bool) error {
+	if target == "" || len(data) == 0 {
+		return nil
+	}
+
+	tfi, err := os.Stat(target)
+	if err != nil {
+		return err
+	}
+
+	var ssi SysStat
+	if rawSysStat, ok := tfi.Sys().(*syscall.Stat_t); ok {
+		ssi = SysStatInfo(rawSysStat)
+	}
+
+	tf, err := os.OpenFile(target, os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+
+	defer tf.Close()
+
+	_, err = tf.Write(data)
+	if err != nil {
+		return err
+	}
+
+	if preserveTimes && ssi.Ok {
+		if err := UpdateFileTimes(target, ssi.Atime, ssi.Mtime); err != nil {
+			log.Warnf("AppendToFile(%v) - UpdateFileTimes error", target)
+		}
+	}
+
+	return nil
+}
+
+type ReplaceInfo struct {
+	PathSuffix   string
+	IsMatchRegex string
+	Match        string
+	Replace      string
+}
+
+// ReplaceFileData replaces the selected file bytes with the caller provided bytes
+func ReplaceFileData(target string, replace []ReplaceInfo, preserveTimes bool) error {
+	if target == "" || len(replace) == 0 {
+		return nil
+	}
+
+	tfi, err := os.Stat(target)
+	if err != nil {
+		return err
+	}
+
+	var ssi SysStat
+	if rawSysStat, ok := tfi.Sys().(*syscall.Stat_t); ok {
+		ssi = SysStatInfo(rawSysStat)
+	}
+
+	raw, err := os.ReadFile(target)
+	if err != nil {
+		return err
+	}
+
+	var replaced bool
+	for _, r := range replace {
+		if r.PathSuffix != "" {
+			if !strings.HasSuffix(target, r.PathSuffix) {
+				continue
+			}
+		}
+
+		if r.Match == "" || r.Replace == "" {
+			continue
+		}
+
+		raw = bytes.ReplaceAll(raw, []byte(r.Match), []byte(r.Replace))
+		replaced = true
+	}
+
+	if replaced {
+		err = os.WriteFile(target, raw, 0644)
+		if err != nil {
+			return err
+		}
+
+		if preserveTimes && ssi.Ok {
+			if err := UpdateFileTimes(target, ssi.Atime, ssi.Mtime); err != nil {
+				log.Warnf("ReplaceFileData(%v) - UpdateFileTimes error", target)
+			}
+		}
+	}
+
+	return nil
+}
+
+type DataUpdaterFn func(target string, data []byte) ([]byte, error)
+
+// UpdateFileData updates all file data in target file using the updater function
+func UpdateFileData(target string, updater DataUpdaterFn, preserveTimes bool) error {
+	if target == "" || updater == nil {
+		return nil
+	}
+
+	tfi, err := os.Stat(target)
+	if err != nil {
+		return err
+	}
+
+	var ssi SysStat
+	if rawSysStat, ok := tfi.Sys().(*syscall.Stat_t); ok {
+		ssi = SysStatInfo(rawSysStat)
+	}
+
+	raw, err := os.ReadFile(target)
+	if err != nil {
+		return err
+	}
+
+	raw, err = updater(target, raw)
+	if err != nil {
+		return err
+	}
+
+	err = os.WriteFile(target, raw, 0644)
+	if err != nil {
+		return err
+	}
+
+	if preserveTimes && ssi.Ok {
+		if err := UpdateFileTimes(target, ssi.Atime, ssi.Mtime); err != nil {
+			log.Warnf("ReplaceFileData(%v) - UpdateFileTimes error", target)
 		}
 	}
 
@@ -814,9 +1044,13 @@ func CopyDirOnly(clone bool, src, dst string) error {
 
 // CopyDir copies a directory
 func CopyDir(clone bool,
-	src, dst string,
-	copyRelPath, skipErrors bool,
-	excludePatterns []string, ignoreDirNames, ignoreFileNames map[string]struct{}) (error, []error) {
+	src string,
+	dst string,
+	copyRelPath bool,
+	skipErrors bool,
+	excludePatterns []string,
+	ignoreDirNames map[string]struct{},
+	ignoreFileNames map[string]struct{}) (error, []error) {
 	log.Debugf("CopyDir(%v,%v,%v,%v,%#v,...)", src, dst, copyRelPath, skipErrors, excludePatterns)
 
 	if src == "" {
@@ -870,6 +1104,16 @@ func CopyDir(clone bool,
 
 ///////////////////////////////////////////////////////////////////////////////
 
+func FileMode(fileName string) string {
+	finfo, err := os.Lstat(fileName)
+	if err != nil {
+		log.Errorf("fsutil.FileMode(%s) - os.Lstat error - %v", fileName, err)
+		return ""
+	}
+
+	return finfo.Mode().String()
+}
+
 // ExeDir returns the directory information for the application
 func ExeDir() string {
 	exePath, err := pdiscover.GetOwnProcPath()
@@ -914,6 +1158,32 @@ func PreparePostUpdateStateDir(statePrefix string) {
 			}
 		}
 	}
+}
+
+// ResolveImageStateBasePath resolves the base path for the state path
+func ResolveImageStateBasePath(statePrefix string) string {
+	log.Debugf("ResolveImageStateBasePath(%s)", statePrefix)
+
+	appDir := ExeDir()
+	if statePrefix == "" {
+		statePrefix = appDir
+	}
+
+	for _, badPath := range badInstallPaths {
+		if strings.HasPrefix(statePrefix, badPath) {
+			log.Debugf("ResolveImageStateBasePath - statePrefix=%s appDir=%s badPath=%s", statePrefix, appDir, badPath)
+			if pinfo, err := os.Stat(tmpPath); err == nil && pinfo.IsDir() {
+				log.Debugf("ResolveImageStateBasePath - overriding state path to %v", stateTmpPath)
+				statePrefix = stateTmpPath
+			} else {
+				log.Debugf("ResolveImageStateBasePath - did not find tmp")
+			}
+
+			break
+		}
+	}
+
+	return statePrefix
 }
 
 // PrepareImageStateDirs ensures that the required application directories exist
@@ -1147,8 +1417,8 @@ func ArchiveFiles(afname string,
 			}
 
 			defer close(f)
-			if _, err := io.Copy(tw, f); err != nil {
-				return err
+			if _, err := io.CopyN(tw, f, th.Size); err != nil {
+				return fmt.Errorf("cannot write %s file: %w", fname, err)
 			}
 		} else {
 			log.Errorf("fsutil.ArchiveFiles: bad file - %s", fname)
@@ -1283,8 +1553,32 @@ func UpdateFileTimes(target string, atime, mtime syscall.Timespec) error {
 	return syscall.UtimesNano(target, ts)
 }
 
-//UpdateSymlinkTimes updates the atime and mtime timestamps on the target symlink
+// UpdateSymlinkTimes updates the atime and mtime timestamps on the target symlink
 func UpdateSymlinkTimes(target string, atime, mtime syscall.Timespec) error {
 	ts := []unix.Timespec{unix.Timespec(atime), unix.Timespec(mtime)}
 	return unix.UtimesNanoAt(unix.AT_FDCWD, target, ts, unix.AT_SYMLINK_NOFOLLOW)
+}
+
+// LoadStructFromFile creates a struct from a file
+func LoadStructFromFile(filePath string, out interface{}) error {
+	if _, err := os.Stat(filePath); err != nil {
+		return err
+	}
+
+	raw, err := os.ReadFile(filePath)
+	if err != nil {
+		return err
+	}
+
+	if len(raw) == 0 {
+		return ErrNoFileData
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	err = decoder.Decode(out)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }

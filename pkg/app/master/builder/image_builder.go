@@ -7,13 +7,16 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/docker-slim/docker-slim/pkg/app/master/config"
-	"github.com/docker-slim/docker-slim/pkg/docker/dockerfile/reverse"
-	"github.com/docker-slim/docker-slim/pkg/util/fsutil"
+	"github.com/slimtoolkit/slim/pkg/app/master/config"
+	"github.com/slimtoolkit/slim/pkg/consts"
+	"github.com/slimtoolkit/slim/pkg/docker/dockerfile"
+	"github.com/slimtoolkit/slim/pkg/util/fsutil"
 
 	docker "github.com/fsouza/go-dockerclient"
 	log "github.com/sirupsen/logrus"
 )
+
+//todo: move/refactor this to be a "pkg/imagebuilder" engine
 
 var (
 	ErrInvalidContextDir = errors.New("invalid context directory")
@@ -133,7 +136,8 @@ func (b *BasicImageBuilder) Remove() error {
 }
 
 // NewImageBuilder creates a new ImageBuilder instances
-func NewImageBuilder(client *docker.Client,
+func NewImageBuilder(
+	client *docker.Client,
 	imageRepoNameTag string,
 	additionalTags []string,
 	imageInfo *docker.Image,
@@ -141,7 +145,8 @@ func NewImageBuilder(client *docker.Client,
 	showBuildLogs bool,
 	overrideSelectors map[string]bool,
 	overrides *config.ContainerOverrides,
-	instructions *config.ImageNewInstructions) (*ImageBuilder, error) {
+	instructions *config.ImageNewInstructions,
+	sourceImage string) (*ImageBuilder, error) {
 
 	labels := map[string]string{}
 	if imageInfo.Config.Labels != nil {
@@ -234,7 +239,7 @@ func NewImageBuilder(client *docker.Client,
 				}
 			case "env":
 				if len(overrides.Env) > 0 {
-					builder.Env = append(builder.Env, instructions.Env...)
+					builder.Env = append(builder.Env, overrides.Env...)
 				}
 			case "label":
 				for k, v := range overrides.Labels {
@@ -333,6 +338,14 @@ func NewImageBuilder(client *docker.Client,
 		}
 	}
 
+	if sourceImage != "" {
+		builder.Labels[consts.DSLabelSourceImage] = sourceImage
+	}
+
+	if imageInfo != nil && imageInfo.ID != "" {
+		builder.Labels[consts.DSLabelSourceImageID] = imageInfo.ID
+	}
+
 	builder.BuildOptions.OutputStream = &builder.BuildLog
 
 	dataTar := filepath.Join(artifactLocation, "files.tar")
@@ -391,7 +404,7 @@ func (b *ImageBuilder) Build() error {
 
 // GenerateDockerfile creates a Dockerfile file
 func (b *ImageBuilder) GenerateDockerfile() error {
-	return reverse.GenerateFromInfo(b.BuildOptions.ContextDir,
+	return dockerfile.GenerateFromInfo(b.BuildOptions.ContextDir,
 		b.Volumes,
 		b.WorkingDir,
 		b.Env,
