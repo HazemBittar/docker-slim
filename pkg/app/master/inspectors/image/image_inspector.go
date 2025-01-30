@@ -2,25 +2,24 @@ package image
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
 	"strings"
 
-	"github.com/docker-slim/docker-slim/pkg/docker/dockerfile/reverse"
-	"github.com/docker-slim/docker-slim/pkg/docker/dockerutil"
-	"github.com/docker-slim/docker-slim/pkg/util/errutil"
-
 	docker "github.com/fsouza/go-dockerclient"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/slimtoolkit/slim/pkg/consts"
+	"github.com/slimtoolkit/slim/pkg/docker/dockerfile/reverse"
+	"github.com/slimtoolkit/slim/pkg/docker/dockerutil"
+	"github.com/slimtoolkit/slim/pkg/util/errutil"
 )
 
 const (
 	slimImageRepo          = "slim"
 	appArmorProfileName    = "apparmor-profile"
 	seccompProfileName     = "seccomp-profile"
-	fatDockerfileName      = "Dockerfile.fat"
 	appArmorProfileNamePat = "%s-apparmor-profile"
 	seccompProfileNamePat  = "%s-seccomp.json"
 	https                  = "https://"
@@ -56,32 +55,40 @@ func NewInspector(client *docker.Client, imageRef string /*, artifactLocation st
 }
 
 // NoImage returns true if the target image doesn't exist
-func (i *Inspector) NoImage() bool {
-	_, err := dockerutil.HasImage(i.APIClient, i.ImageRef)
+func (i *Inspector) NoImage() (bool, error) {
+	//first, do a simple exact match lookup
+	ii, err := dockerutil.HasImage(i.APIClient, i.ImageRef)
 	if err == nil {
-		return false
+		log.Tracef("image.inspector.NoImage: ImageRef=%v ImageIdentity=%#v", i.ImageRef, ii)
+		return false, nil
 	}
 
 	if err != dockerutil.ErrNotFound {
-		log.Debugf("image.inspector.NoImage: err=%v", err)
+		log.Errorf("image.inspector.NoImage: err=%v", err)
+		return true, err
 	}
 
+	//second, try to find something close enough
+	//handle the case where there's no tag in the target image reference
+	//and there are no default 'latest' tag
+	//this will return/save the first available tag
 	if err == dockerutil.ErrNotFound &&
 		!strings.Contains(i.ImageRef, ":") {
 		//check if there are any tags for the target image
 		matches, err := dockerutil.ListImages(i.APIClient, i.ImageRef)
 		if err != nil {
-			log.Debugf("image.inspector.NoImage: err=%v", err)
-			return true
+			log.Errorf("image.inspector.NoImage: err=%v", err)
+			return true, err
 		}
 
-		for ref := range matches {
+		for ref, props := range matches {
+			log.Debugf("image.inspector.NoImage: match.ref=%s match.props=%#v", ref, props)
 			i.ImageRef = ref
-			return false
+			return false, nil
 		}
 	}
 
-	return true
+	return true, nil
 }
 
 // Pull tries to download the target image
@@ -108,11 +115,16 @@ func (i *Inspector) Pull(showPullLog bool, dockerConfigPath, registryAccount, re
 	}
 
 	var err error
+	var authConfig *docker.AuthConfiguration
 	registry := extractRegistry(repo)
-	authConfig, err := getDockerCredential(registryAccount, registrySecret, dockerConfigPath, registry)
+	authConfig, err = getRegistryCredential(registryAccount, registrySecret, dockerConfigPath, registry)
 	if err != nil {
-		log.Debugf("image.inspector.Pull: failed to getDockerCredential err=%v", err)
-		return err
+		log.Warnf("image.inspector.Pull: failed to get registry credential for registry=%s with err=%v", registry, err)
+		//warn, attempt pull anyway, needs to work for public registries
+	}
+
+	if authConfig == nil {
+		authConfig = &docker.AuthConfiguration{}
 	}
 
 	err = i.APIClient.PullImage(input, *authConfig)
@@ -130,7 +142,7 @@ func (i *Inspector) Pull(showPullLog bool, dockerConfigPath, registryAccount, re
 	return nil
 }
 
-func getDockerCredential(registryAccount, registrySecret, dockerConfigPath, registry string) (cred *docker.AuthConfiguration, err error) {
+func getRegistryCredential(registryAccount, registrySecret, dockerConfigPath, registry string) (cred *docker.AuthConfiguration, err error) {
 	if registryAccount != "" && registrySecret != "" {
 		cred = &docker.AuthConfiguration{
 			Username: registryAccount,
@@ -139,11 +151,11 @@ func getDockerCredential(registryAccount, registrySecret, dockerConfigPath, regi
 		return
 	}
 
-	missingAuthConfigErr := errors.New(fmt.Sprintf("could not find an auth config for registry - %s", registry))
+	missingAuthConfigErr := fmt.Errorf("could not find an auth config for registry - %s", registry)
 	if dockerConfigPath != "" {
 		dAuthConfigs, err := docker.NewAuthConfigurationsFromFile(dockerConfigPath)
 		if err != nil {
-			log.Debugf(
+			log.Warnf(
 				"image.inspector.Pull: getDockerCredential - failed to acquire local docker config path=%s err=%s",
 				dockerConfigPath,
 				err.Error(),
@@ -160,7 +172,7 @@ func getDockerCredential(registryAccount, registrySecret, dockerConfigPath, regi
 
 	cred, err = docker.NewAuthConfigurationsFromCredsHelpers(registry)
 	if err != nil {
-		log.Debugf(
+		log.Warnf(
 			"image.inspector.Pull: failed to acquire local docker credential helpers for %s err=%s",
 			registry,
 			err.Error(),
@@ -198,7 +210,7 @@ func extractRegistry(repo string) string {
 	}
 	registry := strings.Split(repo, "/")[0]
 
-	domain := `^(www\.)?[a-z0-9]+([\-\.]{1}[a-z0-9]+)*\.[a-z]{2,5}(:[0-9]{1,5})?(\/.*)?$`
+	domain := `((?:[a-z\d](?:[a-z\d-]{0,63}[a-z\d])?|\*)\.)+[a-z\d][a-z\d-]{0,63}[a-z\d]`
 	ipv6 := `^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))$`
 	ipv4 := `^(((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\.|$)){4})`
 	ipv4Port := `([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})\:?([0-9]{1,5})?`
@@ -244,12 +256,16 @@ func (i *Inspector) Inspect() error {
 		return err
 	}
 
+	log.Tracef("image.Inspector.Inspect: ImageInfo=%#v", i.ImageInfo)
+
 	imageList, err := i.APIClient.ListImages(docker.ListImagesOptions{All: true})
 	if err != nil {
 		return err
 	}
 
+	log.Tracef("image.Inspector.Inspect: imageList.size=%v", len(imageList))
 	for _, r := range imageList {
+		log.Tracef("image.Inspector.Inspect: target=%v record=%#v", i.ImageInfo.ID, r)
 		if r.ID == i.ImageInfo.ID {
 			i.ImageRecordInfo = r
 			break
@@ -266,7 +282,20 @@ func (i *Inspector) Inspect() error {
 
 func (i *Inspector) processImageName() {
 	if len(i.ImageRecordInfo.RepoTags) > 0 {
-		if rtInfo := strings.Split(i.ImageRecordInfo.RepoTags[0], ":"); len(rtInfo) > 1 {
+		//try to find the repo/tag that matches the image ref (if it's not an image ID)
+		//then pick the first available repo/tag if we can't
+		imageName := i.ImageRecordInfo.RepoTags[0]
+		for _, current := range i.ImageRecordInfo.RepoTags {
+			if strings.HasPrefix(current, i.ImageRef) {
+				imageName = current
+				break
+			}
+		}
+
+		if rtInfo := strings.Split(imageName, ":"); len(rtInfo) > 1 {
+			if rtInfo[0] == "<none>" {
+				rtInfo[0] = strings.TrimLeft(i.ImageRecordInfo.ID, "sha256:")[0:8]
+			}
 			i.SlimImageRepo = fmt.Sprintf("%s.slim", rtInfo[0])
 			if nameParts := strings.Split(rtInfo[0], "/"); len(nameParts) > 1 {
 				i.AppArmorProfileName = strings.Join(nameParts, "-")
@@ -290,9 +319,13 @@ func (i *Inspector) ProcessCollectedData() error {
 	if err != nil {
 		return err
 	}
-	fatImageDockerfileLocation := filepath.Join(i.ArtifactLocation, fatDockerfileName)
+	fatImageDockerfileLocation := filepath.Join(i.ArtifactLocation, consts.ReversedDockerfile)
 	err = reverse.SaveDockerfileData(fatImageDockerfileLocation, i.DockerfileInfo.Lines)
 	errutil.FailOn(err)
+	//save the reversed Dockerfile with the old name too (tmp compat)
+	fatImageDockerfileLocationOld := filepath.Join(i.ArtifactLocation, consts.ReversedDockerfileOldName)
+	err = reverse.SaveDockerfileData(fatImageDockerfileLocationOld, i.DockerfileInfo.Lines)
+	errutil.WarnOn(err)
 
 	return nil
 }
@@ -300,8 +333,8 @@ func (i *Inspector) ProcessCollectedData() error {
 // ShowFatImageDockerInstructions prints the original target image Dockerfile instructions
 func (i *Inspector) ShowFatImageDockerInstructions() {
 	if i.DockerfileInfo != nil && i.DockerfileInfo.Lines != nil {
-		fmt.Println("docker-slim: Fat image - Dockerfile instructures: start ====")
+		fmt.Println("slim: Fat image - Dockerfile instructures: start ====")
 		fmt.Println(strings.Join(i.DockerfileInfo.Lines, "\n"))
-		fmt.Println("docker-slim: Fat image - Dockerfile instructures: end ======")
+		fmt.Println("slim: Fat image - Dockerfile instructures: end ======")
 	}
 }
